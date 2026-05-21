@@ -27,6 +27,15 @@ class CustomOpenAIService {
     }
   }
 
+  // OpenRouter privacy: enforce Zero Data Retention on every request.
+  // No-op when CUSTOM_BASE_URL doesn't point at OpenRouter, since the field
+  // is silently ignored by other OpenAI-compatible endpoints.
+  // Set OPENROUTER_DISABLE_ZDR=true in .env to opt out (e.g. for local-only providers).
+  _zdrFields() {
+    if (process.env.OPENROUTER_DISABLE_ZDR === 'true') return {};
+    return { provider: { data_collection: 'deny' } };
+  }
+
   async analyzeDocument(content, existingTags = [], existingCorrespondentList = [], existingDocumentTypesList = [], id, customPrompt = null, options = {}) {
     const cachePath = path.join('./public/images', `${id}.png`);
     try {
@@ -181,6 +190,7 @@ class CustomOpenAIService {
 
       const response = await this.client.chat.completions.create({
         model: model,
+        ...this._zdrFields(),
         messages: [
           {
             role: "system",
@@ -309,6 +319,7 @@ class CustomOpenAIService {
       // Make API request
       const response = await this.client.chat.completions.create({
         model: config.custom.model,
+        ...this._zdrFields(),
         messages: [
           {
             role: "system",
@@ -386,6 +397,7 @@ class CustomOpenAIService {
 
       const response = await this.client.chat.completions.create({
         model: model,
+        ...this._zdrFields(),
         messages: [
           {
             role: "user",
@@ -393,7 +405,7 @@ class CustomOpenAIService {
           }
         ],
         temperature: 0.7,
-        max_tokens: 128000
+        max_tokens: 4096
       });
 
       if (!response?.choices?.[0]?.message?.content) {
@@ -419,6 +431,7 @@ class CustomOpenAIService {
 
       const response = await this.client.chat.completions.create({
         model: model,
+        ...this._zdrFields(),
         messages: [
           {
             role: "user",
