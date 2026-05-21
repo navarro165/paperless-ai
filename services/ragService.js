@@ -57,39 +57,26 @@ class RagService {
     try {
       const aiService = AIServiceFactory.getService();
 
-      // 1. Expand the query into retrieval-optimized keywords so the embedding
-      //    model can match the right documents even for vague personal questions.
-      //    RAG_OWNER_NAME in .env anchors first-person pronouns (my/I) to a real name.
+      // 1. Expand the query into retrieval-optimized keywords.
+      //    The expansion prompt tells Gemini this is a personal document archive
+      //    so it interprets abbreviations in that context (SSN = Social Security Number,
+      //    not a stock ticker; W2 = tax form, not something else).
+      //    Optional: set RAG_OWNER_NAME in .env to anchor first-person pronouns
+      //    (my/I/me) to the archive owner's real name for better personal queries.
       const ownerName = process.env.RAG_OWNER_NAME || '';
-      // Pre-expand common tax/document acronyms that LLMs misinterpret
-      const acronymMap = {
-        '\\bfein\\b': 'Federal Employer Identification Number EIN',
-        '\\bein\\b': 'Employer Identification Number EIN',
-        '\\bssn\\b': 'Social Security Number SSN',
-        '\\bw2\\b': 'W-2 Wage and Tax Statement',
-        '\\bw-2\\b': 'W-2 Wage and Tax Statement',
-        '\\bides\\b': 'Illinois Department of Employment Security IDES',
-        '\\b1099\\b': '1099 tax form',
-        '\\b1040\\b': '1040 Individual Income Tax Return',
-      };
-      let expandedQuestion = question.toLowerCase();
-      for (const [pattern, replacement] of Object.entries(acronymMap)) {
-        expandedQuestion = expandedQuestion.replace(new RegExp(pattern, 'gi'), replacement);
-      }
-      // Use acronym-expanded question as base for LLM expansion
-      let retrievalQuery = expandedQuestion;
+      const ownerHint = ownerName
+        ? ` The archive owner is ${ownerName}. When the query uses "my", "I", or "me", include "${ownerName}" in the search terms.`
+        : '';
+      let retrievalQuery = question;
       try {
-        const ownerContext = ownerName
-          ? `The document owner is ${ownerName}. Any use of "my", "I", or "me" refers to ${ownerName}. Always include "${ownerName}" in the keywords when the question uses first-person pronouns.\n`
-          : '';
-        const expansionPrompt = `You are a document retrieval assistant helping find personal documents. ${ownerContext}Convert the user's question into 5-10 specific keywords or names that would appear verbatim in the actual document containing the answer. Focus on document-specific terms like names, form numbers, tax terms, or identifiers. Output ONLY the keywords comma-separated, no explanation.\n\nQuestion: "${expandedQuestion}"\n\nKeywords:`;
+        const expansionPrompt = `You are a search assistant for a personal document archive containing tax forms, government documents, financial records, insurance documents, and legal papers.${ownerHint} Expand the user's query into 5-10 specific search terms that would appear verbatim in the document containing the answer. Interpret all abbreviations in the context of personal finance and government documents (e.g. SSN = Social Security Number, EIN = Employer Identification Number, W-2 = Wage and Tax Statement, 1040 = tax return). Output ONLY the search terms comma-separated, no explanation.\n\nQuery: "${question}"\n\nSearch terms:`;
         const expanded = await aiService.generateText(expansionPrompt);
         if (expanded && expanded.trim()) retrievalQuery = expanded.trim();
       } catch (err) {
         console.error('Query expansion failed, using original:', err.message);
       }
 
-      // 2. Get context from the RAG service using the expanded query
+      // 2. Retrieve context using the expanded query
       const response = await axios.post(`${this.baseUrl}/context`, {
         question: retrievalQuery,
         max_sources: 20
@@ -97,58 +84,76 @@ class RagService {
 
       const { context, sources } = response.data;
 
-      // 3. Fetch full document objects (content + metadata) for each source
+      // 3. Fetch full document content and prepend rich metadata so Gemini can
+      //    distinguish documents by correspondent, date, and tags.
+      //    Correspondent and date are already in the source object from the RAG
+      //    service (zero extra API calls). Tags come from the full document fetch.
       let enhancedContext = context;
 
       if (sources && sources.length > 0) {
         const fullDocContents = await Promise.all(
           sources.map(async (source) => {
-            if (source.doc_id) {
-              try {
-                const doc = await paperlessService.getDocument(source.doc_id);
-                const content = doc.content || '';
-                const truncated = content.length > 8000 ? content.slice(0, 8000) : content;
-                // Prepend metadata so Gemini can distinguish which document belongs to whom
-                const fileName = doc.archived_file_name || '';
-                const created = doc.created_date || '';
-                const header = [
-                  `Document: ${doc.title || source.title}`,
-                  fileName ? `File: ${fileName}` : '',
-                  created ? `Date: ${created}` : '',
-                ].filter(Boolean).join(' | ');
-                return `${header}\n${truncated}`;
-              } catch (error) {
-                console.error(`Error fetching content for document ${source.doc_id}:`, error.message);
-                return '';
+            if (!source.doc_id) return '';
+            try {
+              const doc = await paperlessService.getDocument(source.doc_id);
+              const content = doc.content || '';
+              const truncated = content.length > 8000 ? content.slice(0, 8000) : content;
+
+              // Build a rich metadata header. Use source.correspondent (already resolved
+              // to a name by the RAG Python service) and source.date rather than IDs.
+              const correspondent = source.correspondent || '';
+              const date = source.date || doc.created_date || '';
+
+              // Resolve tag names via a single bulk request (id__in= filter)
+              let tagNames = '';
+              if (doc.tags && doc.tags.length > 0) {
+                try {
+                  const tagIds = doc.tags.slice(0, 5).join(',');
+                  const tagResp = await paperlessService.client.get(`/tags/?id__in=${tagIds}&page_size=5`);
+                  tagNames = (tagResp.data.results || []).map(t => t.name).join(', ');
+                } catch (e) {
+                  // tags are enhancement only; don't fail the whole document
+                }
               }
+
+              const header = [
+                `Document: ${doc.title || source.title}`,
+                correspondent ? `Correspondent: ${correspondent}` : '',
+                date ? `Date: ${date}` : '',
+                tagNames ? `Tags: ${tagNames}` : '',
+              ].filter(Boolean).join(' | ');
+
+              return `${header}\n${truncated}`;
+            } catch (error) {
+              console.error(`Error fetching content for document ${source.doc_id}:`, error.message);
+              return '';
             }
-            return '';
           })
         );
 
-        enhancedContext = context + '\n\n' + fullDocContents.filter(content => content).join('\n\n---\n\n');
+        enhancedContext = context + '\n\n' + fullDocContents.filter(c => c).join('\n\n---\n\n');
       }
 
-      // 5. Answer using the ORIGINAL question (not the expanded retrieval query)
+      // 4. Answer using the ORIGINAL question against the enriched context
       const ownerInstruction = ownerName
-        ? `The primary document owner is ${ownerName}. When the question uses "my", "I", "me", or "mine", it refers specifically to ${ownerName} and NOT to any other person whose documents may appear in the context.\n`
+        ? `When the question uses "my", "I", "me", or "mine", it refers to ${ownerName} and not to any other person whose documents may appear in the context.\n`
         : '';
       const prompt = `
-        You are a helpful assistant that answers questions about documents.
+        You are a helpful assistant that searches a personal document archive and surfaces relevant findings.
         ${ownerInstruction}
-        Answer the following question precisely, based on the provided documents:
+        The user is asking: ${question}
 
-        Question: ${question}
-
-        Context from relevant documents:
+        Documents retrieved from the archive:
         ${enhancedContext}
 
-        Important instructions:
-        - Use ONLY information from the provided documents
-        - If the answer is not contained in the documents, respond: "This information is not contained in the documents." (in the same language as the question)
-        - Avoid assumptions or speculation beyond the given context
-        - Answer in the same language as the question was asked
-        - Do not mention document numbers or source references, answer as if it were a natural conversation
+        Instructions:
+        - Search ALL provided documents for anything relevant to the question.
+        - If you find relevant information in multiple documents, list ALL of them with the correspondent/source so the user can identify which one applies to them.
+        - Do NOT pick just one answer and discard the others. Surface every potential match.
+        - Do NOT say "this information is not contained in the documents" if you found anything even partially relevant — show what you found and where.
+        - Only say information is not available if you genuinely found nothing relevant after scanning all documents.
+        - Answer in the same language as the question.
+        - Format clearly: if multiple matches, list each with its source (correspondent name and date from the document header).
         `;
 
       let answer;
