@@ -55,25 +55,47 @@ class RagService {
    */
   async askQuestion(question) {
     try {
-      // 1. Get context from the RAG service
+      const aiService = AIServiceFactory.getService();
+
+      // 1. Expand the query into retrieval-optimized keywords so the embedding
+      //    model can match the right documents even for vague personal questions
+      let retrievalQuery = question;
+      try {
+        const expansionPrompt = `You are a document retrieval assistant. Convert the user's question into 5-10 specific keywords that would appear verbatim in the document containing the answer. Output ONLY the keywords comma-separated, no explanation.\n\nQuestion: "${question}"\n\nKeywords:`;
+        const expanded = await aiService.generateText(expansionPrompt);
+        if (expanded && expanded.trim()) retrievalQuery = expanded.trim();
+      } catch (err) {
+        console.error('Query expansion failed, using original:', err.message);
+      }
+
+      // 2. Get context from the RAG service using the expanded query
       const response = await axios.post(`${this.baseUrl}/context`, {
-        question,
+        question: retrievalQuery,
         max_sources: 20
       }, { timeout: 30000 });
-      
+
       const { context, sources } = response.data;
-      
-      // 2. Fetch full content for each source document using doc_id
+
+      // 3. Fetch full document objects (content + metadata) for each source
       let enhancedContext = context;
-      
+
       if (sources && sources.length > 0) {
-        // Fetch full document content for each source
         const fullDocContents = await Promise.all(
           sources.map(async (source) => {
             if (source.doc_id) {
               try {
-                const fullContent = await paperlessService.getDocumentContent(source.doc_id);
-                return `Full document content for ${source.title || 'Document ' + source.doc_id}:\n${fullContent}`;
+                const doc = await paperlessService.getDocument(source.doc_id);
+                const content = doc.content || '';
+                const truncated = content.length > 8000 ? content.slice(0, 8000) : content;
+                // Prepend metadata so Gemini can distinguish which document belongs to whom
+                const fileName = doc.archived_file_name || '';
+                const created = doc.created_date || '';
+                const header = [
+                  `Document: ${doc.title || source.title}`,
+                  fileName ? `File: ${fileName}` : '',
+                  created ? `Date: ${created}` : '',
+                ].filter(Boolean).join(' | ');
+                return `${header}\n${truncated}`;
               } catch (error) {
                 console.error(`Error fetching content for document ${source.doc_id}:`, error.message);
                 return '';
@@ -82,15 +104,11 @@ class RagService {
             return '';
           })
         );
-        
-        // Combine original context with full document contents
-        enhancedContext = context + '\n\n' + fullDocContents.filter(content => content).join('\n\n');
+
+        enhancedContext = context + '\n\n' + fullDocContents.filter(content => content).join('\n\n---\n\n');
       }
-      
-      // 3. Use AI service to generate an answer based on the enhanced context
-      const aiService = AIServiceFactory.getService();
-      
-      // Create a language-agnostic prompt that works in any language
+
+      // 5. Answer using the ORIGINAL question (not the expanded retrieval query)
       const prompt = `
         You are a helpful assistant that answers questions about documents.
 
