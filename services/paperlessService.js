@@ -21,7 +21,8 @@ class PaperlessService {
         headers: {
           'Authorization': `Token ${config.paperless.apiToken}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 30000
       });
     }
   }

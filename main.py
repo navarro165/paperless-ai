@@ -63,7 +63,7 @@ CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 COLLECTION_NAME = "documents"
 BM25_WEIGHT = 0.3
 SEMANTIC_WEIGHT = 0.7
-MAX_RESULTS = 20
+MAX_RESULTS = 40
 
 # Download NLTK resources if not present
 nltk.download('punkt', quiet=True)
@@ -1180,7 +1180,7 @@ class SearchEngine:
             
         try:
             # Prepare pairs for cross-encoder
-            pairs = [(query, f"{result['title']} {result['content'][:500]}" if 'content' in result and result['content'] else result.get('title', '')) 
+            pairs = [(query, f"{result['title']} {result['content'][:400]}" if 'content' in result and result['content'] else result.get('title', ''))
                     for result in results]
             
             # Make sure we have valid pairs
@@ -1256,7 +1256,7 @@ class SearchEngine:
                 if len(snippet) + len(sentence) <= max_len:
                     snippet += sentence + ". "
                 else:
-                    break
+                    continue
             
             # If snippet is empty (no term matches), just use the beginning of the content
             if not snippet and content:
