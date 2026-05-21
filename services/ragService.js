@@ -56,10 +56,10 @@ class RagService {
   async askQuestion(question) {
     try {
       // 1. Get context from the RAG service
-      const response = await axios.post(`${this.baseUrl}/context`, { 
+      const response = await axios.post(`${this.baseUrl}/context`, {
         question,
-        max_sources: 5
-      });
+        max_sources: 20
+      }, { timeout: 30000 });
       
       const { context, sources } = response.data;
       
