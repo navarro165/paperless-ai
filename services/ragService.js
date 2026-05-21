@@ -58,10 +58,31 @@ class RagService {
       const aiService = AIServiceFactory.getService();
 
       // 1. Expand the query into retrieval-optimized keywords so the embedding
-      //    model can match the right documents even for vague personal questions
-      let retrievalQuery = question;
+      //    model can match the right documents even for vague personal questions.
+      //    RAG_OWNER_NAME in .env anchors first-person pronouns (my/I) to a real name.
+      const ownerName = process.env.RAG_OWNER_NAME || '';
+      // Pre-expand common tax/document acronyms that LLMs misinterpret
+      const acronymMap = {
+        '\\bfein\\b': 'Federal Employer Identification Number EIN',
+        '\\bein\\b': 'Employer Identification Number EIN',
+        '\\bssn\\b': 'Social Security Number SSN',
+        '\\bw2\\b': 'W-2 Wage and Tax Statement',
+        '\\bw-2\\b': 'W-2 Wage and Tax Statement',
+        '\\bides\\b': 'Illinois Department of Employment Security IDES',
+        '\\b1099\\b': '1099 tax form',
+        '\\b1040\\b': '1040 Individual Income Tax Return',
+      };
+      let expandedQuestion = question.toLowerCase();
+      for (const [pattern, replacement] of Object.entries(acronymMap)) {
+        expandedQuestion = expandedQuestion.replace(new RegExp(pattern, 'gi'), replacement);
+      }
+      // Use acronym-expanded question as base for LLM expansion
+      let retrievalQuery = expandedQuestion;
       try {
-        const expansionPrompt = `You are a document retrieval assistant. Convert the user's question into 5-10 specific keywords that would appear verbatim in the document containing the answer. Output ONLY the keywords comma-separated, no explanation.\n\nQuestion: "${question}"\n\nKeywords:`;
+        const ownerContext = ownerName
+          ? `The document owner is ${ownerName}. Any use of "my", "I", or "me" refers to ${ownerName}. Always include "${ownerName}" in the keywords when the question uses first-person pronouns.\n`
+          : '';
+        const expansionPrompt = `You are a document retrieval assistant helping find personal documents. ${ownerContext}Convert the user's question into 5-10 specific keywords or names that would appear verbatim in the actual document containing the answer. Focus on document-specific terms like names, form numbers, tax terms, or identifiers. Output ONLY the keywords comma-separated, no explanation.\n\nQuestion: "${expandedQuestion}"\n\nKeywords:`;
         const expanded = await aiService.generateText(expansionPrompt);
         if (expanded && expanded.trim()) retrievalQuery = expanded.trim();
       } catch (err) {
@@ -109,9 +130,12 @@ class RagService {
       }
 
       // 5. Answer using the ORIGINAL question (not the expanded retrieval query)
+      const ownerInstruction = ownerName
+        ? `The primary document owner is ${ownerName}. When the question uses "my", "I", "me", or "mine", it refers specifically to ${ownerName} and NOT to any other person whose documents may appear in the context.\n`
+        : '';
       const prompt = `
         You are a helpful assistant that answers questions about documents.
-
+        ${ownerInstruction}
         Answer the following question precisely, based on the provided documents:
 
         Question: ${question}
